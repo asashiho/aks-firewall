@@ -1,0 +1,213 @@
+# Azure Kubernetes Service (AKS) で Standard SKU ロード バランサーを使用する
+# https://docs.microsoft.com/ja-jp/azure/aks/load-balancer-standard
+# https://docs.microsoft.com/ja-jp/azure/aks/load-balancer-standard#restrict-access-to-specific-ip-ranges
+
+# Environment variables
+PREFIX="hoge-bank-lb-"
+RG="${PREFIX}rg"
+AKS_NAME="aks"
+LOC="japaneast"
+
+# Create a resource group
+az group create -n $RG -l $LOC
+
+# Create the AKS cluster
+az aks create \
+    -g $RG \
+    -n $AKS_NAME \
+    -l $LOC \
+    --kubernetes-version 1.17.3 \
+    --node-count 1 \
+    --generate-ssh-keys \
+    --network-plugin azure \
+    --service-cidr 10.0.0.0/16 \
+    --dns-service-ip 10.0.0.10 \
+    --docker-bridge-address 172.17.0.1/16 \
+    --load-balancer-sku standard
+
+
+# Get credentials (allow only Your PC)
+az aks get-credentials -g $RG -n $AKS_NAME
+
+# Check Your Kubernetes Cluster
+kubectl cluster-info  
+kubectl get node
+
+---
+# Kubernetes Serviceを作成してクラスタ外部にサービス公開
+
+AKS_NODE_RG=$(az aks show -g $RG -n $AKS_NAME --query 'nodeResourceGroup' -o tsv )
+AKS_RES_RG=$(echo $AKS_NODE_RG | sed 's/^\(\w\+\)\+/\L\1/')
+
+AKS_NSG=$(az resource list --query "[?contains(resourceGroup, '$PREFIX') && type=='Microsoft.Network/networkSecurityGroups'].[name]" -o tsv)
+
+az network nsg rule list \
+    --nsg-name $AKS_NSG \
+    -g $AKS_NODE_RG \
+    -o table
+
+null
+
+---
+# LoadBalancerSourceRangesで着信できるIPアドレスを指定する
+
+## ServiceのEXTERNAL-IPを調べる
+サンプルアプリをデプロイ
+```
+kubectl apply -f loadbalancer.yaml
+```
+
+```
+kubectl get service
+
+NAME         TYPE           CLUSTER-IP     EXTERNAL-IP    PORT(S)        AGE
+kubernetes   ClusterIP      10.0.0.1       <none>         443/TCP        12m
+nginx        LoadBalancer   10.0.177.222   20.44.xxx.xxx   80:32076/TCP   33s
+```
+
+### 動作確認
+```
+curl http://20.44.xxx.xxx/
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+</head>
+</body>
+</html>
+```
+
+### NSGのルールを確認
+```
+az network nsg rule list \
+    --nsg-name $AKS_NSG \
+    -g $AKS_NODE_RG \
+    -o table
+```
+```
+Name                                              ResourceGroup                     Priority    SourcePortRanges    SourceAddressPrefixes    SourceASG    Access    Protocol    Direction    DestinationPortRanges    DestinationAddressPrefixes    DestinationASG
+------------------------------------------------  --------------------------------  ----------  ------------------  -----------------------  -----------  --------  ----------  -----------  -----------------------  ----------------------------  ----------------
+ab033568af7ac4439bf867f26cada197-TCP-80-Internet  mc_hoge-bank-lb-rg_aks_japaneast  500         *                   Internet                 None     
+    Allow     Tcp         Inbound      80                       20.44.xxx.xxx                  None
+
+```
+
+自分のIPアドレスを調べる
+```
+curl globalip.me
+39.xxx.xxx.xxx
+```
+
+```
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  loadBalancerSourceRanges:
+  - 39.xxx.xxx.xxx/32
+```
+
+```
+kubectl apply -f loadbalancer.yaml
+```
+
+```
+curl http://20.44.xxx.xxx/
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+</head>
+</body>
+</html>
+```
+
+### NSGのルールを確認
+```
+az network nsg rule list \
+    --nsg-name $AKS_NSG \
+    -g $AKS_NODE_RG \
+    -o table
+```
+Name                                                      ResourceGroup                                                            Priority    SourcePortRanges    SourceAddressPrefixes    SourceASG    Access    Protocol    Direction    DestinationPortRanges    DestinationAddressPrefixes    DestinationASG
+--------------------------------------------------------  -----------------------------------------------------------------------  ----------  ------------------  -----------------------  -----------  --------  ----------  -----------  -----------------------  ----------------------------  ----------------
+a89bb8932c6a54edcab0055ee4330474-TCP-80-39.110.159.85_32  mc_hoge-bank-networkpolicy41-rg_hoge-bank-networkpolicy41-aks_japaneast  500         *      
+             39.xxx.xxx.xxx/32         None         Allow     Tcp         Inbound      80                       20.44.173.105                 None   
+
+
+### 許可されれたアドレス以外からの動作確認(39.xxx.xxx.xxx)
+Azure Cloud Shell からテスト
+```
+curl globalip.me
+13.64.243.254
+```
+```
+curl http://20.44.xxx.xxx/
+timeout
+```
+
+### AKSのNSGを手動で書き換えるとどうなるか？
+やっちゃだめです
+https://docs.microsoft.com/bs-latn-ba/azure/aks/support-policies#network-ports-access-and-nsgs
+
+
+#ロード バランサーを内部として構成する
+# ロード バランサーを内部にして、パブリック IP を公開しないように構成することもできます。 ロード バランサーを内部として構成するには、LoadBalancer サービスにアノテーションとして service.beta.kubernetes.io/azure-load-balancer-internal: "true" を追加します。 
+
+az network public-ip list -g $AKS_RES_RG -o table
+```
+Name                                         ResourceGroup                     Location    Zones    Address       AddressVersion    AllocationMethod  
+  IdleTimeoutInMinutes    ProvisioningState
+-------------------------------------------  --------------------------------  ----------  -------  ------------  ----------------  ------------------  ----------------------  -------------------
+1adbb0ce-665e-4876-9836-1f2bfe85534e         MC_hoge-bank-lb-rg_aks_japaneast  japaneast            20.44.169.1   IPv4              Static
+  30                      Succeeded
+kubernetes-ab033568af7ac4439bf867f26cada197  mc_hoge-bank-lb-rg_aks_japaneast  japaneast            20.44.xxx.xxx  IPv4              Static
+  4                       Succeeded
+```
+
+sanmpleのServiceにアノテーションを設定
+```
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+```
+
+```
+kubectl apply -f loadbalancer.yaml
+```
+KubernetesのServiceを確認
+```
+kubectl get svc
+
+NAME         TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+kubernetes   ClusterIP      10.0.0.1       <none>        443/TCP        57m
+nginx        LoadBalancer   10.0.177.222   10.240.0.35   80:32076/TCP   45m
+```
+
+Azureから払い出されているPublic IPアドレスを確認
+```
+az network public-ip list -g $AKS_RES_RG -o table     
+
+Name                                  ResourceGroup                     Location    Zones    Address      AddressVersion    AllocationMethod    IdleTimeoutInMinutes    ProvisioningState
+------------------------------------  --------------------------------  ----------  -------  -----------  ----------------  ------------------  ----------------------  -------------------
+1adbb0ce-665e-4876-9836-1f2bfe85534e  MC_hoge-bank-lb-rg_aks_japaneast  japaneast            20.44.169.1  IPv4              Static              30    
+                  Succeeded
+```
+
+---
+# clean up
+az group delete -n $RG --yes
+
+
+<参考>
+az resource list --query "[?contains(resourceGroup,'$PREFIX')].[name,resourceGroup,type]" -o table
+
+Column1                               Column2                           Column3
+------------------------------------  --------------------------------  ------------------------------------------
+aks                                   hoge-bank-lb-rg                   Microsoft.ContainerService/managedClusters
+aks-nodepool1-14303633-vmss           mc_hoge-bank-lb-rg_aks_japaneast  Microsoft.Compute/virtualMachineScaleSets
+kubernetes                            mc_hoge-bank-lb-rg_aks_japaneast  Microsoft.Network/loadBalancers
+kubernetes-internal                   mc_hoge-bank-lb-rg_aks_japaneast  Microsoft.Network/loadBalancers
+aks-agentpool-14303633-nsg            mc_hoge-bank-lb-rg_aks_japaneast  Microsoft.Network/networkSecurityGroups
+1adbb0ce-665e-4876-9836-1f2bfe85534e  MC_hoge-bank-lb-rg_aks_japaneast  Microsoft.Network/publicIPAddresses
+aks-vnet-14303633                     MC_hoge-bank-lb-rg_aks_japaneast  Microsoft.Network/virtualNetworks
+

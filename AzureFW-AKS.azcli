@@ -1,0 +1,165 @@
+# UDR および Azure Firewall の送信の種類を使用してクラスターをデプロイする
+# https://docs.microsoft.com/ja-jp/azure/aks/egress-outboundtype#deploy-a-cluster-with-outbound-type-of-udr-and-azure-firewall
+
+# Environment variables
+PREFIX="hoge-bank$RANDOM-"
+RG="${PREFIX}rg"
+LOC="japaneast"
+NAME="${PREFIX}outboundudr"
+AKS_NAME="${PREFIX}aks"
+VNET_NAME="${PREFIX}vnet"
+AKSSUBNET_NAME="${PREFIX}akssubnet"
+SVCSUBNET_NAME="${PREFIX}svcsubnet"
+FWSUBNET_NAME="AzureFirewallSubnet"
+FWNAME="${PREFIX}fw"
+FWPUBLICIP_NAME="${PREFIX}fwpublicip"
+FWIPCONFIG_NAME="${PREFIX}fwconfig"
+FWROUTE_TABLE_NAME="${PREFIX}fwrt"
+FWROUTE_NAME="${PREFIX}fwrn"
+FWROUTE_NAME_INTERNET="${PREFIX}fwinternet"
+DEVSUBNET_NAME="${PREFIX}dev"
+
+
+# Update Subscription Name for setting SUBID
+SUBID=$(az account show --query id -o tsv) 
+
+# Create Azure Resource Group
+az group create --name $RG --location $LOC
+
+# Create Azure VNET
+az network vnet create \
+    --resource-group $RG \
+    --name $VNET_NAME \
+    --address-prefixes 100.64.0.0/16 \
+    --subnet-name $AKSSUBNET_NAME \
+    --subnet-prefix 100.64.1.0/24
+
+az network vnet subnet create \
+    --resource-group $RG \
+    --vnet-name $VNET_NAME \
+    --name $SVCSUBNET_NAME \
+    --address-prefix 100.64.2.0/24
+
+az network vnet subnet create \
+    --resource-group $RG \
+    --vnet-name $VNET_NAME \
+    --name $FWSUBNET_NAME \
+    --address-prefix 100.64.3.0/24
+
+# Create Azure Firewall
+az network public-ip create -g $RG -n $FWPUBLICIP_NAME -l $LOC --sku "Standard"
+
+az extension add --name azure-firewall
+az network firewall create -g $RG -n $FWNAME -l $LOC
+
+az network firewall ip-config create -g $RG \
+    -f $FWNAME \
+    -n $FWIPCONFIG_NAME \
+    --public-ip-address $FWPUBLICIP_NAME \
+    --vnet-name $VNET_NAME
+
+# Capture Firewall IP Address for Later Use
+FWPUBLIC_IP=$(az network public-ip show -g $RG -n $FWPUBLICIP_NAME --query "ipAddress" -o tsv)
+FWPRIVATE_IP=$(az network firewall show -g $RG -n $FWNAME --query "ipConfigurations[0].privateIpAddress" -o tsv)
+
+# Create UDR and add a route for Azure Firewall
+az network route-table create -g $RG --name $FWROUTE_TABLE_NAME
+az network route-table route create -g $RG \
+    --name $FWROUTE_NAME \
+    --route-table-name $FWROUTE_TABLE_NAME \
+    --address-prefix 0.0.0.0/0 \
+    --next-hop-type VirtualAppliance \
+    --next-hop-ip-address $FWPRIVATE_IP \
+    --subscription $SUBID
+
+az network route-table route create -g $RG \
+    --name $FWROUTE_NAME_INTERNET \
+    --route-table-name $FWROUTE_TABLE_NAME \
+    --address-prefix $FWPUBLIC_IP/32 \
+    --next-hop-type Internet
+
+
+# Add Network FW Rules
+az network firewall network-rule create -g $RG \
+    -f $FWNAME \
+    --collection-name 'aksfwnr' \
+    -n 'netrules' \
+    --protocols 'Any' \
+    --source-addresses '*' \
+    --destination-addresses '*' \
+    --destination-ports '*' \
+    --action allow \
+    --priority 100
+
+# Add Application FW Rules
+# IMPORTANT: Add AKS required egress endpoints
+az network firewall application-rule create -g $RG -f $FWNAME \
+    --collection-name 'AKS_Global_Required' \
+    --action allow \
+    --priority 100 \
+    -n 'required' \
+    --source-addresses '*' \
+    --protocols 'http=80' 'https=443' \
+    --target-fqdns \
+        'aksrepos.azurecr.io' \
+        '*blob.core.windows.net' \
+        'mcr.microsoft.com' \
+        '*cdn.mscr.io' \
+        '*.data.mcr.microsoft.com' \
+        'management.azure.com' \
+        'login.microsoftonline.com' \
+        'ntp.ubuntu.com' \
+        'packages.microsoft.com' \
+        'acs-mirror.azureedge.net'
+
+# Associate route table with next hop to Firewall to the AKS subnet
+az network vnet subnet update -g $RG \
+    --vnet-name $VNET_NAME \
+    --name $AKSSUBNET_NAME \
+    --route-table $FWROUTE_TABLE_NAME
+
+# Create SP and Assign Permission to Virtual Network
+SP=$(az ad sp create-for-rbac -n "${PREFIX}sp" --skip-assignment --output json)
+SP_ID=$(echo $SP | jq -r .appId)
+SP_PASSWORD=$(echo $SP | jq -r .password)
+
+# Assign SP Permission to VNET
+VNETID=$(az network vnet show -g $RG --name $VNET_NAME --query id -o tsv)
+az role assignment create --assignee $SP_ID --scope $VNETID --role Contributor
+
+SUBNETID="/subscriptions/$SUBID/resourceGroups/$RG/providers/Microsoft.Network/virtualNetworks/$VNET_NAME/subnets/$AKSSUBNET_NAME"
+
+# Create Azure Kubernetes Service Cluster
+az aks create \
+    -g $RG \
+    -n $AKS_NAME \
+    -l $LOC \
+    --kubernetes-version 1.17.3 \
+    --node-count 1 \
+    --service-principal $SP_ID \
+    --client-secret $SP_PASSWORD \
+    --network-plugin azure \
+    --service-cidr 192.168.0.0/16 \
+    --dns-service-ip 192.168.0.10 \
+    --docker-bridge-address 172.22.0.1/29 \
+    --vnet-subnet-id $SUBNETID \
+    --load-balancer-sku standard \
+    --outbound-type userDefinedRouting \
+    --api-server-authorized-ip-ranges $FWPUBLIC_IP
+
+# Retrieve your IP address
+CURRENT_IP=$(curl ifconfig.me)  
+
+# Add to AKS approved list
+az aks update -g $RG -n $AKS_NAME --api-server-authorized-ip-ranges $CURRENT_IP/32
+
+# Get credentials (allow only Your PC)
+az aks get-credentials -g $RG -n $AKS_NAME
+
+# Check Your Kubernetes Cluster
+kubectl cluster-info  
+kubectl get node
+
+---
+# clean up
+az group delete -n $RG --yes

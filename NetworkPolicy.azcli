@@ -1,0 +1,70 @@
+# Azure Kubernetes Service (AKS) のネットワーク ポリシーを使用したポッド間のトラフィックの保護
+# https://docs.microsoft.com/ja-jp/azure/aks/use-network-policies
+
+# Environment variables
+PREFIX="hoge-bank-networkpolicy-"
+RG="${PREFIX}rg"
+VNET_NAME="${PREFIX}vnet"
+AKSSUBNET_NAME="${PREFIX}akssubnet"
+AKS_NAME="aks"
+LOC="japaneast"
+
+# Create a resource group
+az group create -n $RG -l $LOC
+
+# Create a virtual network and subnet
+az network vnet create \
+    -g $RG \
+    -n $VNET_NAME \
+    --address-prefixes 10.0.0.0/8 \
+    --subnet-name $AKSSUBNET_NAME \
+    --subnet-prefix 10.240.0.0/16
+
+# Create a service principal and read in the application ID
+SP=$(az ad sp create-for-rbac --output json)
+SP_ID=$(echo $SP | jq -r .appId)
+SP_PASSWORD=$(echo $SP | jq -r .password)
+
+# Get the virtual network resource ID
+VNET_ID=$(az network vnet show -g $RG -n $VNET_NAME --query id -o tsv)
+
+# Assign the service principal Contributor permissions to the virtual network resource
+az role assignment create --assignee $SP_ID --scope $VNET_ID --role Contributor
+
+# Get the virtual network subnet resource ID
+SUBNET_ID=$(az network vnet subnet show -g $RG --vnet-name $VNET_NAME -n $AKSSUBNET_NAME --query id -o tsv)
+
+# Create the AKS cluster and specify the virtual network and service principal information
+# Enable network policy by using the `--network-policy` parameter
+az aks create \
+    -g $RG \
+    -n $AKS_NAME \
+    -l $LOC \
+    --kubernetes-version 1.17.3 \
+    --node-count 1 \
+    --service-principal $SP_ID \
+    --client-secret $SP_PASSWORD \
+    --generate-ssh-keys \
+    --network-policy azure \
+    --network-plugin azure \
+    --service-cidr 10.0.0.0/16 \
+    --dns-service-ip 10.0.0.10 \
+    --docker-bridge-address 172.17.0.1/16 \
+    --vnet-subnet-id $SUBNET_ID \
+    --load-balancer-sku standard
+
+
+# Get credentials (allow only Your PC)
+az aks get-credentials -g $RG -n $AKS_NAME
+
+# Check Your Kubernetes Cluster
+kubectl cluster-info  
+kubectl get node
+
+
+
+kubectl apply -f networkpolicy.yaml
+
+---
+# clean up
+az group delete -n $RG --yes
